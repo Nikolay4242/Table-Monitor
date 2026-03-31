@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+main.py
+
+Прототип системы детекции состояний одного столика на видео.
+- используется готовая YOLOv8n-модель для обнаружения людей;
+- выбирается один столик через cv2.selectROI;
+- фиксируются события table_empty, table_occupied, approach_to_table;
+- события сохраняются в Pandas DataFrame / CSV;
+- считается среднее время между уходом предыдущего человека и подходом следующего;
+- создается output.mp4 с цветным bbox столика.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import cv2
+import pandas as pd
+from ultralytics import YOLO
+import numpy as np
+import json
+
+
+class TableMonitor:
+    """Отслеживание состояния одного столика с EMA-сглаживанием."""
+
+    def __init__(self, video_path: str):
+        self.video_path = video_path
+
+        # EMA для плавного определения состояния
+        self.ema_presence = 0.0
+        self.ema_alpha = 0.3  # 0 = сильное сглаживание, 1 = без сглаживания
+
+        # Загружаем YOLOv8n
+        self.model = YOLO("yolov8n.pt")
+
+        # События для последующего DataFrame
+        self.events = []
+
+        # Текущее состояние столика
+        self.current_state = None  # empty / occupied
+
+        # Время, когда стол последний раз стал пустым
+        self.last_empty_timestamp = None
+
+        # Интервалы между уходом и следующим подходом
+        self.wait_times = []
+
+    @staticmethod
+    def format_time(seconds: float) -> str:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins:02d}:{secs:02d}"
+
+    def load_table_from_config(self):
+        """Загружает полигон столика из tables_config.json."""
+        config_path = Path("tables_config.json")
+        if not config_path.exists():
+            return None
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        polygon = data["tables"][0]["polygon"]
+        polygon = [tuple(map(int, p)) for p in polygon]
+        print(f"Использован полигон из tables_config.json: {polygon}")
+        return polygon
+
+    def select_table_roi(self, frame):
+        """Выбор столика через GUI или ввод координат вручную."""
+        try:
+            preview = frame.copy()
+            cv2.putText(preview, "Select table ROI and press ENTER", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            roi = cv2.selectROI("Select table", preview, fromCenter=False, showCrosshair=True)
+            cv2.destroyAllWindows()
+            x, y, w, h = map(int, roi)
+            if w == 0 or h == 0:
+                raise RuntimeError("ROI not selected")
+            return x, y, w, h
+        except Exception:
+            cv2.imwrite("first_frame.jpg", frame)
+            print("GUI недоступен. Первый кадр сохранен в first_frame.jpg")
+            raw = input("Введите ROI (x y width height): ").strip()
+            x, y, w, h = map(int, raw.split())
+            return x, y, w, h
+
+    def person_intersects_table(self, person_box, table_polygon):
+        """Человек считается относящимся к столику, если центр bbox в полигона."""
+        px1, py1, px2, py2 = person_box
+        center_x = int((px1 + px2) / 2)
+        center_y = int((py1 + py2) / 2)
+        return cv2.pointPolygonTest(table_polygon, (center_x, center_y), False) >= 0
+
+    def add_event(self, timestamp, event_name):
+        """Добавляет событие в журнал."""
+        self.events.append({
+            "timestamp_sec": round(timestamp, 2),
+            "timestamp_mmss": self.format_time(timestamp),
+            "event": event_name,
+        })
+
+    def process(self):
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Не удалось открыть видео: {self.video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        ok, first_frame = cap.read()
+        if not ok:
+            raise RuntimeError("Не удалось прочитать первый кадр")
+
+        # Координаты столика
+        table_polygon = self.load_table_from_config()
+        if table_polygon is None:
+            x, y, w, h = self.select_table_roi(first_frame)
+            table_polygon = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+        table_polygon = cv2.convexHull(np.array(table_polygon, dtype=np.int32))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        writer = cv2.VideoWriter(
+            "output.mp4",
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+
+        frame_index = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_index += 1
+            current_time = frame_index / fps
+
+            results = self.model(frame, classes=[0], verbose=False)
+
+            person_found_in_table = False
+            if results and len(results) > 0 and results[0].boxes is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                confs = results[0].boxes.conf.cpu().numpy()
+                for box, conf in zip(boxes, confs):
+                    if conf < 0.35:
+                        continue
+                    x1, y1, x2, y2 = map(int, box)
+                    is_near_table = self.person_intersects_table((x1, y1, x2, y2), table_polygon)
+                    if is_near_table:
+                        person_found_in_table = True
+                    color = (0, 255, 0) if is_near_table else (255, 0, 0)
+                    label = "TABLE PERSON" if is_near_table else "OUTSIDE"
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # --- EMA сглаживание состояния ---
+            self.ema_presence = self.ema_alpha * float(person_found_in_table) + (1 - self.ema_alpha) * self.ema_presence
+            stable_person_present = self.ema_presence > 0.5
+            new_state = "occupied" if stable_person_present else "empty"
+
+            # События
+            if self.current_state is None:
+                self.current_state = new_state
+                if new_state == "empty":
+                    self.add_event(current_time, "table_empty")
+                    self.last_empty_timestamp = current_time
+                else:
+                    self.add_event(current_time, "table_occupied")
+            elif new_state != self.current_state:
+                self.current_state = new_state
+                if new_state == "empty":
+                    self.add_event(current_time, "table_empty")
+                    self.last_empty_timestamp = current_time
+                else:
+                    self.add_event(current_time, "table_occupied")
+                    self.add_event(current_time, "approach_to_table")
+                    if self.last_empty_timestamp is not None:
+                        self.wait_times.append(current_time - self.last_empty_timestamp)
+
+            # Рисуем полигон столика
+            table_color = (0, 255, 0) if self.current_state == "empty" else (0, 0, 255)
+            cv2.polylines(frame, [table_polygon], True, table_color, 3)
+
+            x_min = int(table_polygon[:, :, 0].min())
+            y_min = int(table_polygon[:, :, 1].min())
+            label_text = "TABLE: EMPTY" if self.current_state == "empty" else "TABLE: OCCUPIED"
+            cv2.putText(frame, label_text, (x_min, max(30, y_min - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, table_color, 2)
+            cv2.putText(frame, f"Time: {self.format_time(current_time)}",
+                        (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            writer.write(frame)
+
+        cap.release()
+        writer.release()
+        self.save_report()
+
+    def save_report(self):
+        df = pd.DataFrame(self.events)
+        df.to_csv("events.csv", index=False)
+        average_wait = sum(self.wait_times) / len(self.wait_times) if self.wait_times else None
+
+        print("\n" + "=" * 60)
+        print("RESULT")
+        print("=" * 60)
+        print("Видео с визуализацией: output.mp4")
+        print("Журнал событий:        events.csv")
+        print("\nСобытия:")
+        print(df)
+        if average_wait is not None:
+            print(f"\nСреднее время между уходом гостя и подходом следующего: {average_wait:.2f} сек")
+            with open("report.txt", "w", encoding="utf-8") as f:
+                f.write(f"Среднее время между уходом гостя и подходом следующего: {average_wait:.2f} сек\n")
+                f.write(f"Количество измерений: {len(self.wait_times)}\n")
+            print("Текстовый отчет:       report.txt")
+        else:
+            print("\nНедостаточно событий для вычисления среднего времени.")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", required=True, help="Путь к видео, например: video1.mp4")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.video):
+        raise FileNotFoundError(f"Файл не найден: {args.video}")
+
+    monitor = TableMonitor(args.video)
+    monitor.process()
+
+if __name__ == "__main__":
+    main()
